@@ -81,6 +81,8 @@ jobs:
           export CODEX_SIGNING_CERT_SHA256="$(keytool -exportcert -keystore "$CODEX_SIGNING_KEYSTORE" \
             -storepass:env CODEX_SIGNING_STORE_PASSWORD -alias "$CODEX_SIGNING_KEY_ALIAS" | sha256sum | cut -d ' ' -f 1)"
           export GRADLE_USER_HOME="$GITHUB_WORKSPACE/work/gradle-home"
+          sed -i "s|mavenCentral()|maven { url 'https://maven-central.storage-download.googleapis.com/maven2/' }|g" \
+            "$GITHUB_WORKSPACE/android/build.gradle" "$GITHUB_WORKSPACE/android/settings.gradle"
           gradle -p "$GITHUB_WORKSPACE/android" --no-daemon --max-workers=2 --console=plain \
             '-Dorg.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8' \
             --init-script "$GITHUB_WORKSPACE/tools/ci/reuse-native-baseline.gradle" \
