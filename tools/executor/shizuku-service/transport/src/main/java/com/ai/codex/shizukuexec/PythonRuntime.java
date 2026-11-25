@@ -12,7 +12,9 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 /** Admit fixed Python data before the interpreter can import any staged file. */
 final class PythonRuntime {
@@ -90,13 +92,18 @@ final class PythonRuntime {
         Set<String> actual = new HashSet<>();
         trace.at(AdmissionTrace.Stage.PYTHON_TREE);
         walk(root, root, actual, trace, ownerUid);
-        if (!actual.equals(expected)) {
-            String unexpected = actual.stream().filter(path -> !expected.contains(path)).sorted().findFirst().orElse(null);
-            String missing = expected.stream().filter(path -> !actual.contains(path)).sorted().findFirst().orElse(null);
-            trace.subject(unexpected != null ? "unexpected:" + unexpected : "missing:" + missing);
-            trace.fact("expected", expected.size()); trace.fact("observed", actual.size());
-            throw new SecurityException("Unexpected or missing staged Python file");
-        }
+        requireExactTree(expected, actual, trace);
+    }
+
+    static void requireExactTree(Set<String> expected, Set<String> actual, AdmissionTrace trace) throws Exception {
+        if (actual.equals(expected)) return;
+        String missing = expected.stream().filter(path -> !actual.contains(path)).sorted().findFirst().orElse(null);
+        List<String> unexpected = actual.stream().filter(path -> !expected.contains(path)).sorted()
+            .collect(Collectors.toList());
+        trace.subject(missing != null ? "missing:" + missing : "unexpected:" + unexpected.get(0));
+        trace.fact("expected", expected.size()); trace.fact("observed", actual.size());
+        if (missing != null) throw new SecurityException("A staged Python file went missing during verification");
+        throw new Deployment.UnexpectedPythonFiles(unexpected);
     }
     private static File descendant(File root, String relative, Set<String> paths) throws Exception {
         if (relative.isEmpty() || relative.startsWith("/") || relative.contains("\\") || relative.indexOf('\0') >= 0

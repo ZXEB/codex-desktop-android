@@ -6,6 +6,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 
 /** All execution inputs come from the installed APK, never from Binder/RPC. */
 public final class Deployment {
@@ -21,6 +22,18 @@ public final class Deployment {
     final boolean applicationLaunch;
     final String workingDirectory;
     final int applicationUid;
+    /** Every listed runtime file passed admission, but the tree also contains extra entries. */
+    public static final class UnexpectedPythonFiles extends SecurityException {
+        private final List<String> paths;
+
+        UnexpectedPythonFiles(List<String> paths) {
+            super("Unexpected staged Python files (" + paths.size() + ")");
+            this.paths = List.copyOf(paths);
+        }
+
+        public List<String> paths() { return paths; }
+    }
+
     /** Read-only admission for an application owner before selecting Shizuku. */
     public static void verifyInstalledInputs(Context context) throws Exception {
         new Deployment(context, new AdmissionTrace(), null, null, null);

@@ -101,7 +101,14 @@ public final class CodexExecutorRuntime {
             try {
                 admitQualifiedDeployment();
                 if (directNative) nativeLaunch = new NativeLaunch(context, controllerHome);
-                Deployment.verifyInstalledInputs(context);
+                try {
+                    Deployment.verifyInstalledInputs(context);
+                } catch (Deployment.UnexpectedPythonFiles extra) {
+                    if (!applicationLaunch || nativeLaunch == null) throw extra;
+                    nativeLaunch.quarantineUnexpectedPythonFiles(extra.paths(), context.getApplicationInfo().uid);
+                    Deployment.verifyInstalledInputs(context);
+                    Log.w("Codex-executor", "Recovered Python runtime by quarantining " + extra.paths().size() + " extra entries");
+                }
                 if (applicationLaunch) openApplicationSession();
                 else main.post(this::attachBinder);
             } catch (Exception | LinkageError error) { fail("qualified_native_deployment_unavailable", error); }

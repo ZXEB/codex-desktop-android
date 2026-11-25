@@ -11,7 +11,9 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.security.MessageDigest;
+import java.util.List;
 import java.util.UUID;
 
 /** App-owned paths and signed Python data. This class never executes a command. */
@@ -63,7 +65,13 @@ final class NativeLaunch {
         }
         byte[] inventory = asset(context, runtime.getString("manifestAsset"), 2097152);
         requireHash(inventory, runtime.getString("manifestSha256"));
-        installRuntime(context, new JSONObject(new String(inventory, StandardCharsets.UTF_8)), uid);
+        // A killed process must not leave a half-written file or pending alias in the admitted tree.
+        File stagedEntry = new File(session, "python-runtime-entry");
+        try {
+            installRuntime(context, new JSONObject(new String(inventory, StandardCharsets.UTF_8)), uid, stagedEntry);
+        } finally {
+            Files.deleteIfExists(stagedEntry.toPath());
+        }
         if (controllerHome == null || !controllerHome.startsWith("/") || controllerHome.contains("..")
                 || controllerHome.equals("/") || controllerHome.startsWith(data.getPath() + "/")) {
             throw new SecurityException("Invalid controller HOME");
@@ -78,7 +86,7 @@ final class NativeLaunch {
         writeNew(new File(launchPath), (launch.toString() + "\n").getBytes(StandardCharsets.UTF_8));
     }
 
-    private void installRuntime(Context context, JSONObject manifest, int uid) throws Exception {
+    private void installRuntime(Context context, JSONObject manifest, int uid, File stagedEntry) throws Exception {
         File root = privateDirectory(new File(pythonRoot), uid);
         JSONArray files = manifest.getJSONArray("dataFiles");
         for (int i = 0; i < files.length(); ++i) {
@@ -93,7 +101,10 @@ final class NativeLaunch {
                 if (!OsConstants.S_ISREG(stat.st_mode) || stat.st_uid != uid || (stat.st_mode & 0022) != 0
                         || !exactPath(file)) throw new SecurityException("Existing runtime file is not private regular data");
                 try (InputStream input = new FileInputStream(file)) { requireHash(read(input, 16777216), item.getString("sha256")); }
-            } else writeNew(file, bytes);
+            } else {
+                writeNew(stagedEntry, bytes);
+                Os.rename(stagedEntry.getPath(), file.getPath());
+            }
         }
         JSONArray aliases = manifest.getJSONArray("runtimeAliases");
         for (int i = 0; i < aliases.length(); ++i) {
@@ -107,11 +118,31 @@ final class NativeLaunch {
                 if (!OsConstants.S_ISLNK(stat.st_mode) || stat.st_uid != uid) throw new SecurityException("Existing runtime alias is not an owned symlink");
                 if (Os.readlink(alias.getPath()).equals(target)) continue;
             } catch (android.system.ErrnoException absent) { if (absent.errno != OsConstants.ENOENT) throw absent; }
-            File temporary = new File(alias.getParentFile(), alias.getName() + "." + nonce);
-            Os.symlink(target, temporary.getPath());
-            Os.rename(temporary.getPath(), alias.getPath());
+            Os.symlink(target, stagedEntry.getPath());
+            Os.rename(stagedEntry.getPath(), alias.getPath());
         }
     }
+    void quarantineUnexpectedPythonFiles(List<String> paths, int uid) throws Exception {
+        File root = privateDirectory(new File(pythonRoot), uid);
+        File holding = privateDirectory(new File(root.getParentFile(), "python-quarantine"), uid);
+        File quarantine = privateDirectory(new File(holding, nonce), uid);
+        for (String relative : paths) {
+            File source = descendant(root, relative, uid);
+            StructStat stat;
+            try {
+                stat = Os.lstat(source.getPath());
+            } catch (android.system.ErrnoException absent) {
+                if (absent.errno != OsConstants.ENOENT) throw absent;
+                continue;
+            }
+            if (stat.st_uid != uid || !(OsConstants.S_ISREG(stat.st_mode) || OsConstants.S_ISLNK(stat.st_mode))) {
+                throw new SecurityException("Extra Python runtime entry is not an app-owned file or symlink");
+            }
+            File destination = descendant(quarantine, relative, uid);
+            Os.rename(source.getPath(), destination.getPath());
+        }
+    }
+
     private static String boundedPath(String path) { return path.length() <= 512 ? path : path.substring(0, 512) + "[truncated]"; }
     private boolean exactPath(File file) throws Exception {
         return applicationLaunch ? dataPaths.isCanonicalExact(file) : dataPaths.isExact(file);
