@@ -23,7 +23,7 @@ public final class PythonRuntimeTest {
         PythonRuntime.requireExactTree(signed, signed, new AdmissionTrace());
     }
 
-    @Test public void missingRequiredEntryDoesNotOfferQuarantine() {
+    @Test public void missingRequiredEntryDoesNotOfferQuarantine() throws Exception {
         Set<String> signed = Set.of(DATA, ALIAS);
         AdmissionTrace trace = new AdmissionTrace();
         trace.at(AdmissionTrace.Stage.PYTHON_TREE);
