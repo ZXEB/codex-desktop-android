@@ -1,0 +1,169 @@
+name: Build recovery APK on GitHub
+
+on:
+  push:
+    branches: [build/python-runtime-recovery-apk]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.repository == 'ZXEB/codex-desktop-android'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      BASELINE_SHA: d07eec662cfac91486468610b7eea6f16cc96f1ea1c9ba841652c44cf695cf74
+      BASELINE_CERT: 39d204ce0a7ee777f4aa0aab5085d6669e1dc744463912f31509eafea74b0d31
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Check source and install Android toolchain
+        run: |
+          python3 -B tools/ci/check-source-integrity.py
+          python3 -B tools/runtime/test-live-notifications.py --output "$RUNNER_TEMP/live-notifications"
+          RUSTUP_HOME="$GITHUB_WORKSPACE/work/ci/cache/rustup" python3 -B tools/ci/prepare-runner-storage.py
+          python3 -B tools/ci/manual_runner.py android
+      - name: Recover the verified full v85 inputs
+        run: |
+          stage="$GITHUB_WORKSPACE/work/recovery-apk"
+          mkdir -p "$stage"
+          curl --fail --location --retry 3 --connect-timeout 20 \
+            https://github.com/JinShichang/codex-desktop-android/releases/download/v85/Codex-Android-v85-full.apk \
+            --output "$stage/upstream.apk"
+          python3 -B tools/workstation/recover-apk-inputs.py \
+            --apk "$stage/upstream.apk" --apk-sha256 "$BASELINE_SHA" --cert-sha256 "$BASELINE_CERT" \
+            --java "$JAVA_HOME/bin/java" --apksigner-jar "$ANDROID_HOME/build-tools/36.0.0/lib/apksigner.jar" \
+            --output "$stage/native"
+          python3 -B - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          stage = Path('work/recovery-apk')
+          image = stage / 'image' / 'phone-runtime'
+          image.parent.mkdir()
+          (stage / 'native/debug-assets/phone-runtime').rename(image)
+          rootfs = image / 'codex-phone-rootfs.tar.gz'
+          (image / 'codex-phone-rootfs.tgz').rename(rootfs)
+          release = json.loads((image / 'release.json').read_bytes())
+          with rootfs.open('rb') as archive:
+              actual = hashlib.file_digest(archive, 'sha256').hexdigest()
+          if actual != release['spec']['sha256'] or rootfs.stat().st_size != release['spec']['compressedBytes']:
+              raise SystemExit('Embedded environment differs from the pinned APK inventory')
+          with ZipFile(stage / 'upstream.apk') as original:
+              for folder in ('desktop-client', 'gnu-engine'):
+                  target = stage / 'payloads' / folder / 'manifest.json'
+                  target.parent.mkdir(parents=True)
+                  target.write_bytes(original.read(f'assets/{folder}/manifest.json'))
+          PY
+      - name: Compile and sign a fresh-install build
+        run: |
+          stage="$GITHUB_WORKSPACE/work/recovery-apk"
+          export CODEX_BASELINE_APK="$stage/upstream.apk"
+          export CODEX_BASELINE_APK_SHA256="$BASELINE_SHA"
+          export CODEX_SIGNING_KEYSTORE="$RUNNER_TEMP/codex-fork.p12"
+          export CODEX_SIGNING_KEY_ALIAS=codexfork
+          export CODEX_SIGNING_STORE_PASSWORD="$(openssl rand -hex 24)"
+          export CODEX_SIGNING_KEY_PASSWORD="$CODEX_SIGNING_STORE_PASSWORD"
+          echo "::add-mask::$CODEX_SIGNING_STORE_PASSWORD"
+          keytool -genkeypair -storetype PKCS12 -keystore "$CODEX_SIGNING_KEYSTORE" \
+            -storepass:env CODEX_SIGNING_STORE_PASSWORD -alias "$CODEX_SIGNING_KEY_ALIAS" \
+            -keyalg RSA -keysize 3072 -validity 3650 -dname 'CN=Codex ZXEB recovery'
+          export CODEX_SIGNING_CERT_SHA256="$(keytool -exportcert -keystore "$CODEX_SIGNING_KEYSTORE" \
+            -storepass:env CODEX_SIGNING_STORE_PASSWORD -alias "$CODEX_SIGNING_KEY_ALIAS" | sha256sum | cut -d ' ' -f 1)"
+          export GRADLE_USER_HOME="$GITHUB_WORKSPACE/work/gradle-home"
+          gradle -p "$GITHUB_WORKSPACE/android" --no-daemon --max-workers=2 --console=plain \
+            '-Dorg.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8' \
+            --init-script "$GITHUB_WORKSPACE/tools/ci/reuse-native-baseline.gradle" \
+            -PcodexRequireExecutor=true -PcodexBuildToolsVersion=36.0.0 \
+            "-PcodexRuntimeJni=$stage/native/runtime" "-PcodexX11Jni=$stage/native/x11" \
+            "-PcodexFrozenTransportJni=$stage/native/transport" \
+            "-PcodexExecutorAssets=$stage/native/executor/assets" \
+            "-PcodexExecutorJni=$stage/native/executor/jniLibs" \
+            "-PcodexDebugJni=$stage/native/debug-jni" "-PcodexDebugAssets=$stage/native/debug-assets" \
+            "-PcodexPhoneImageAssets=$stage/image" -PcodexEmbedPhoneImage=true -PcodexPayloadsFromPhoneImage=true \
+            "-PcodexDesktopClientAssets=$stage/payloads" "-PcodexGnuEngineAssets=$stage/payloads" \
+            -PcodexVersionCode=87 -PcodexVersionName=0.2.0-v87-zxeb-python-recovery \
+            :app:assembleDebug :shizukuTransport:testDebugUnitTest
+          printf '%s\n' "$CODEX_SIGNING_CERT_SHA256" > "$stage/certificate.sha256"
+      - name: Verify the APK and encrypt the personal download
+        run: |
+          stage="$GITHUB_WORKSPACE/work/recovery-apk"
+          apk="$GITHUB_WORKSPACE/android/app/build/outputs/apk/debug/app-debug.apk"
+          output="$GITHUB_WORKSPACE/work/recovery-download"
+          tools="$ANDROID_HOME/build-tools/36.0.0"
+          mkdir -p "$output"
+          python3 -B tools/executor/runas-runtime/verify-production-apk.py "$apk" --output "$output/executor-verification.json"
+          python3 -B tools/install/verify-apk-contents.py "$apk" --debug --native-update --image-payloads > "$output/apk-contents.json"
+          "$tools/apksigner" verify --verbose --print-certs "$apk" > "$output/signing.txt"
+          grep -F "Signer #1 certificate SHA-256 digest: $(cat "$stage/certificate.sha256")" "$output/signing.txt"
+          "$tools/zipalign" -c -P 16 4 "$apk"
+          python3 -B - "$apk" "$BASELINE_SHA" > "$output/build-info.json" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          from zipfile import ZipFile
+
+          apk = Path(sys.argv[1])
+          with ZipFile(apk) as archive:
+              dex = b''.join(archive.read(name) for name in archive.namelist() if name.endswith('.dex'))
+              for encoded in (b'quarantineUnexpectedPythonFiles', b'UnexpectedPythonFiles;',
+                              b'python-runtime-entry', b'android.requestPromotedOngoing'):
+                  if encoded not in dex:
+                      raise SystemExit(f'Compiled fix missing: {encoded!r}')
+              if b'setRequestPromotedOngoing' in dex:
+                  raise SystemExit('Obsolete notification API still present')
+          with apk.open('rb') as source:
+              digest = hashlib.file_digest(source, 'sha256').hexdigest()
+          print(json.dumps(dict(apk='Codex-Android-v87-ZXEB-full.apk', bytes=apk.stat().st_size,
+              sha256=digest, gitHead=os.environ['GITHUB_SHA'], baselineSha256=sys.argv[2],
+              requiresFreshInstall=True, deviceTested=False), indent=2))
+          PY
+          cat > "$RUNNER_TEMP/recipient.pem" <<'CERTIFICATE'
+          -----BEGIN CERTIFICATE-----
+          MIIELzCCApegAwIBAgIUCLW7Ck69RmpE1lUukrEBVH4y5hwwDQYJKoZIhvcNAQEL
+          BQAwJzElMCMGA1UEAwwcQ29kZXggQVBLIGFydGlmYWN0IHJlY2lwaWVudDAeFw0y
+          NjExMjUxNzE3MDlaFw0yNjEyMjUxNzE3MDlaMCcxJTAjBgNVBAMMHENvZGV4IEFQ
+          SyBhcnRpZmFjdCByZWNpcGllbnQwggGiMA0GCSqGSIb3DQEBAQUAA4IBjwAwggGK
+          AoIBgQCmRGsothEwvcqs3zXPRkKFdFxR8LiCr4njZ9cKDExMz03DKnagEvZQxbdd
+          teRhrvvpLU4XMc1Evs6SHJGOjlRHsE+neKGV9G3ChfVYnfACndrghLWUKdtAZsCr
+          BGUfm4cIwrA3yrtgD1auS0zxltff/m6pFvtvKpvPnsfx849B2L8Czavug0tL2yQr
+          7P2GaulsuaQitbm4G/G8L0L9blIOVvMCOYICFbU1o/4eaja6r30zBan9M4u8iOJ1
+          3hNPSbcylxLSURAvA05jrIjZqmRobq0AIm4IZLtdmcur0EU1we2l/nl6uYigOHQ8
+          9gU1pXAl9+Pu+HoFvPws/ZrD8M4+/teNHm0l7aPel4M49XxdXgyfwKI6f92sJLOQ
+          bUppEZod2qnmq8w7KWXI/b1txEiIslA+2sqc+kEvvJWVquEzi8hsK7KkTg36TWha
+          JA6AbROWn7yTc4dOk/5MbMwhd++fb+hvD+AftV/eTAkovv1zq0R/f7QZpUIWhQdp
+          do//RfsCAwEAAaNTMFEwHQYDVR0OBBYEFC4E1Upd+51OKa+qTd+ne3CqwVpIMB8G
+          A1UdIwQYMBaAFC4E1Upd+51OKa+qTd+ne3CqwVpIMA8GA1UdEwEB/wQFMAMBAf8w
+          DQYJKoZIhvcNAQELBQADggGBAAlcGC534JSbfExK5vbK7t1EZQs0xW4Jz/eoaH9B
+          SNMg3RTBI2cER5b6Q1SENRBNz5orrceNt5ciqOBBhLjQFMcj+UI7dAqmFymO5GBt
+          KiT4Xnz5kDs6ag3RSxmp7cEOd5DKceWiNX2SJpXG9g9FVo6upiIOL8uPZ3RmN8gC
+          Qea9onkUdlxgJdxAKj3a4kd/h4HuGiBt0A4k9EJA6WWvAOrgJMaiQiaYXw2l0q6X
+          tUeG8mE7RYLSzH6MyDZ+Vns3nlOnVKYv5Th0EhiemHy+tsbonIMdwWfx8yWieGbs
+          bgHqmhbAKScbOc6zeM4ioOEdCt1i7KQoo1WD43HGx5L5RvU4YwbSyQ4gs1g3s7pV
+          sHsxYiyqUD83wa4buOrD1oGSpKbDhFcOho/QuhUR9V/l0QS1eOfgtSco6YSTBs9l
+          hPH2TN0UaeLs5EgbDCjx+IsM7OzP/eX8f3yaRBVY8ya2VHPYXvVxdfYjdqapXaEk
+          8lkAU7LN8kpk2nhEPvH9uQ7Qzw==
+          -----END CERTIFICATE-----
+          CERTIFICATE
+          openssl cms -encrypt -binary -stream -aes-256-gcm -outform DER \
+            -in "$apk" -out "$output/Codex-Android-v87-ZXEB-full.apk.cms" -recip "$RUNNER_TEMP/recipient.pem"
+          cat "$output/build-info.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: codex-android-v87-personal
+          path: work/recovery-download
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
